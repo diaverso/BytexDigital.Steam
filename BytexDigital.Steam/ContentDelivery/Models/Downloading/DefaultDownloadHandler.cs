@@ -228,24 +228,33 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                     .OrderBy(x => x.Key)
                     .SelectMany(x => x);
 
-                var taskFactoriesQueue = sortedChunks.Select(
-                        chunkJob =>
-                            new Func<Task>(
-                                async () => await Task.Run(
-                                    () => DownloadChunkAsync(chunkJob, cancellationToken))))
-                    .ToList();
+                var chunkList = sortedChunks.ToList();
+                Logger?.LogTrace($"Starting sequential download of {chunkList.Count} chunks");
 
-                Logger?.LogTrace($"Starting {taskFactoriesQueue.Count} download tasks");
-
-                if (taskFactoriesQueue.Count > 0)
+                foreach (var chunkJob in chunkList)
                 {
-                    var tasksFactoryFailuresLookup = new ConcurrentDictionary<Func<Task>, int>();
-
-                    await ParallelAsync(
-                        _steamContentClient.MaxConcurrentDownloadsPerTask,
-                        taskFactoriesQueue,
-                        cancellationToken);
+                    Logger?.LogTrace($"[DEBUG] Downloading chunk for file: {chunkJob.ManifestFile.FileName}, chunk id: {chunkJob.Chunk.Id}");
+                    await DownloadChunkAsync(chunkJob, cancellationToken);
                 }
+
+                //var taskFactoriesQueue = sortedChunks.Select(
+                //        chunkJob =>
+                //            new Func<Task>(
+                //                async () => await Task.Run(
+                //                    () => DownloadChunkAsync(chunkJob, cancellationToken))))
+                //    .ToList();
+
+                //Logger?.LogTrace($"Starting {taskFactoriesQueue.Count} download tasks");
+
+                //if (taskFactoriesQueue.Count > 0)
+                //{
+                //    var tasksFactoryFailuresLookup = new ConcurrentDictionary<Func<Task>, int>();
+
+                //    await ParallelAsync(
+                //        _steamContentClient.MaxConcurrentDownloadsPerTask,
+                //        taskFactoriesQueue,
+                //        cancellationToken);
+                //}
 
                 State = DownloadHandlerStateEnum.Downloaded;
                 Logger?.LogTrace("Completed download tasks");
@@ -292,30 +301,53 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             }
         }
 
+        //private async Task ParallelAsync(
+        //    int maxParallel,
+        //    IEnumerable<Func<Task>> taskFactories,
+        //    CancellationToken cancellationToken)
+        //{
+        //    var taskFactoriesSource = taskFactories.ToArray();
+        //    var tasksRunning = new List<Task>(50);
+        //    var index = 0;
+
+        //    do
+        //    {
+        //        while (tasksRunning.Count < maxParallel && index < taskFactoriesSource.Length)
+        //        {
+        //            var taskFactory = taskFactoriesSource[index++];
+
+        //            tasksRunning.Add(taskFactory());
+        //        }
+
+        //        var completedTask = await Task.WhenAny(tasksRunning).ConfigureAwait(false);
+
+        //        await completedTask.ConfigureAwait(false);
+
+        //        tasksRunning.Remove(completedTask);
+        //    } while (index < taskFactoriesSource.Length || tasksRunning.Count != 0);
+        //}
+
         private async Task ParallelAsync(
             int maxParallel,
             IEnumerable<Func<Task>> taskFactories,
             CancellationToken cancellationToken)
         {
-            var taskFactoriesSource = taskFactories.ToArray();
-            var tasksRunning = new List<Task>(50);
-            var index = 0;
-
-            do
+            int taskId = 0;
+            foreach (var factory in taskFactories)
             {
-                while (tasksRunning.Count < maxParallel && index < taskFactoriesSource.Length)
+                Logger?.LogTrace($"[DEBUG] Starting task {taskId}");
+                try
                 {
-                    var taskFactory = taskFactoriesSource[index++];
-
-                    tasksRunning.Add(taskFactory());
+                    await factory();
+                    Logger?.LogTrace($"[DEBUG] Finished task {taskId}");
                 }
-
-                var completedTask = await Task.WhenAny(tasksRunning).ConfigureAwait(false);
-
-                await completedTask.ConfigureAwait(false);
-
-                tasksRunning.Remove(completedTask);
-            } while (index < taskFactoriesSource.Length || tasksRunning.Count != 0);
+                catch (Exception ex)
+                {
+                    Logger?.LogError(ex, $"[DEBUG] Exception in task {taskId}: {ex.Message}");
+                    throw;
+                }
+                taskId++;
+            }
         }
 
         private Task VerifyFileAsync(ManifestFile file, string directory, ConcurrentBag<ChunkJob> chunks)
@@ -415,8 +447,9 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
                     downloadSuccess = true;
                 }
-                catch (Exception)
+                catch (Exception ex)
                 {
+                    Logger?.LogError(ex, $"Failed to download chunk {chunkJob.InternalChunk.ChunkID} for file {chunkJob.ManifestFile.FileName}: {ex.Message}");
                     _serverPool.ReturnServer(server, true);
                     server = null;
                 }
