@@ -231,30 +231,24 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                 var chunkList = sortedChunks.ToList();
                 Logger?.LogTrace($"Starting sequential download of {chunkList.Count} chunks");
 
-                foreach (var chunkJob in chunkList)
+                var taskFactoriesQueue = sortedChunks.Select(
+                        chunkJob =>
+                            new Func<Task>(
+                                async () => await Task.Run(
+                                    () => DownloadChunkAsync(chunkJob, cancellationToken))))
+                    .ToList();
+
+                Logger?.LogTrace($"Starting {taskFactoriesQueue.Count} download tasks");
+
+                if (taskFactoriesQueue.Count > 0)
                 {
-                    Logger?.LogTrace($"[DEBUG] Downloading chunk for file: {chunkJob.ManifestFile.FileName}, chunk id: {chunkJob.Chunk.Id}");
-                    await DownloadChunkAsync(chunkJob, cancellationToken);
+                    var tasksFactoryFailuresLookup = new ConcurrentDictionary<Func<Task>, int>();
+
+                    await ParallelAsync(
+                        _steamContentClient.MaxConcurrentDownloadsPerTask,
+                        taskFactoriesQueue,
+                        cancellationToken);
                 }
-
-                //var taskFactoriesQueue = sortedChunks.Select(
-                //        chunkJob =>
-                //            new Func<Task>(
-                //                async () => await Task.Run(
-                //                    () => DownloadChunkAsync(chunkJob, cancellationToken))))
-                //    .ToList();
-
-                //Logger?.LogTrace($"Starting {taskFactoriesQueue.Count} download tasks");
-
-                //if (taskFactoriesQueue.Count > 0)
-                //{
-                //    var tasksFactoryFailuresLookup = new ConcurrentDictionary<Func<Task>, int>();
-
-                //    await ParallelAsync(
-                //        _steamContentClient.MaxConcurrentDownloadsPerTask,
-                //        taskFactoriesQueue,
-                //        cancellationToken);
-                //}
 
                 State = DownloadHandlerStateEnum.Downloaded;
                 Logger?.LogTrace("Completed download tasks");
@@ -301,53 +295,30 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             }
         }
 
-        //private async Task ParallelAsync(
-        //    int maxParallel,
-        //    IEnumerable<Func<Task>> taskFactories,
-        //    CancellationToken cancellationToken)
-        //{
-        //    var taskFactoriesSource = taskFactories.ToArray();
-        //    var tasksRunning = new List<Task>(50);
-        //    var index = 0;
-
-        //    do
-        //    {
-        //        while (tasksRunning.Count < maxParallel && index < taskFactoriesSource.Length)
-        //        {
-        //            var taskFactory = taskFactoriesSource[index++];
-
-        //            tasksRunning.Add(taskFactory());
-        //        }
-
-        //        var completedTask = await Task.WhenAny(tasksRunning).ConfigureAwait(false);
-
-        //        await completedTask.ConfigureAwait(false);
-
-        //        tasksRunning.Remove(completedTask);
-        //    } while (index < taskFactoriesSource.Length || tasksRunning.Count != 0);
-        //}
-
         private async Task ParallelAsync(
             int maxParallel,
             IEnumerable<Func<Task>> taskFactories,
             CancellationToken cancellationToken)
         {
-            int taskId = 0;
-            foreach (var factory in taskFactories)
+            var taskFactoriesSource = taskFactories.ToArray();
+            var tasksRunning = new List<Task>(50);
+            var index = 0;
+
+            do
             {
-                Logger?.LogTrace($"[DEBUG] Starting task {taskId}");
-                try
+                while (tasksRunning.Count < maxParallel && index < taskFactoriesSource.Length)
                 {
-                    await factory();
-                    Logger?.LogTrace($"[DEBUG] Finished task {taskId}");
+                    var taskFactory = taskFactoriesSource[index++];
+
+                    tasksRunning.Add(taskFactory());
                 }
-                catch (Exception ex)
-                {
-                    Logger?.LogError(ex, $"[DEBUG] Exception in task {taskId}: {ex.Message}");
-                    throw;
-                }
-                taskId++;
-            }
+
+                var completedTask = await Task.WhenAny(tasksRunning).ConfigureAwait(false);
+
+                await completedTask.ConfigureAwait(false);
+
+                tasksRunning.Remove(completedTask);
+            } while (index < taskFactoriesSource.Length || tasksRunning.Count != 0);
         }
 
         private Task VerifyFileAsync(ManifestFile file, string directory, ConcurrentBag<ChunkJob> chunks)
