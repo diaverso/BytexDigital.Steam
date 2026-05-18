@@ -21,16 +21,19 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             FileStream.Close();
         }
 
-        public override async Task WriteAsync(ulong offset, byte[] data)
+        public override Task WriteAsync(ulong offset, byte[] data)
         {
             if (FileStream == null)
             {
-                FileStream = new FileStream(_filePath, FileMode.Create, FileAccess.Write, FileShare.None, 131072, true);
+                // useAsync: false — avoids Windows I/O Completion Port callbacks that can
+                // race with DisposeAsync and cause ACCESS_VIOLATION in TppWorkerThread
+                FileStream = new FileStream(_filePath, FileMode.Create, FileAccess.Write, FileShare.None, 131072, false);
                 FileStream.SetLength((long) _fileSize);
             }
-            
+
             FileStream.Seek((long) offset, SeekOrigin.Begin);
-            await FileStream.WriteAsync(data, 0, data.Length).ConfigureAwait(false);
+            FileStream.Write(data, 0, data.Length);
+            return Task.CompletedTask;
         }
 
         public override async Task CancelAsync()
