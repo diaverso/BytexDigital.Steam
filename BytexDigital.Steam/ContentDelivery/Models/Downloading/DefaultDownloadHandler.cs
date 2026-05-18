@@ -202,13 +202,18 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                 throw new DownloadHandlerStateMismatchException(DownloadHandlerStateEnum.Verified, State);
             }
 
+            // Per-download CTS: cancelled in finally BEFORE disposing resources so that
+            // in-flight HttpClient I/O completion callbacks (TppWorkerThread) don't access
+            // freed memory → prevents ACCESS_VIOLATION c0000005
+            using var downloadCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
             try
             {
                 State = DownloadHandlerStateEnum.Downloading;
 
                 Logger?.LogTrace("Creating Steam CDN server pool");
 
-                _serverPool = new SteamCdnServerPool(_steamContentClient, AppId, cancellationToken)
+                _serverPool = new SteamCdnServerPool(_steamContentClient, AppId, downloadCts.Token)
                 {
                     Logger = Logger
                 };
@@ -235,7 +240,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                         chunkJob =>
                             new Func<Task>(
                                 async () => await Task.Run(
-                                    () => DownloadChunkAsync(chunkJob, cancellationToken))))
+                                    () => DownloadChunkAsync(chunkJob, downloadCts.Token))))
                     .ToList();
 
                 Logger?.LogTrace($"Starting {taskFactoriesQueue.Count} download tasks");
@@ -247,7 +252,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                     await ParallelAsync(
                         _steamContentClient.MaxConcurrentDownloadsPerTask,
                         taskFactoriesQueue,
-                        cancellationToken);
+                        downloadCts.Token);
                 }
 
                 State = DownloadHandlerStateEnum.Downloaded;
@@ -263,6 +268,13 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             }
             finally
             {
+                // Cancel all in-flight chunk tasks BEFORE releasing resources.
+                // Without this, abandoned tasks in ParallelAsync keep running after
+                // _serverPool.Close(), and their I/O completion callbacks (TppWorkerThread)
+                // try to read from freed memory → ACCESS_VIOLATION c0000005.
+                downloadCts.Cancel();
+                await Task.Delay(50).ConfigureAwait(false);
+
                 if (_fileWriters.Count > 0)
                 {
                     Logger?.LogTrace("Disposing all file writers");
