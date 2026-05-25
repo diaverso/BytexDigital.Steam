@@ -42,6 +42,12 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
         public ILogger Logger { get; set; }
 
+        /// <summary>
+        /// Optional diagnostic callback — set from outside to receive per-chunk trace messages.
+        /// Fires on thread-pool threads; must be thread-safe.
+        /// </summary>
+        public Action<string> DiagnosticLog { get; set; }
+
         public DefaultDownloadHandler(
             SteamContentClient steamContentClient,
             Manifest manifest,
@@ -423,7 +429,13 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
         private async Task DownloadChunkAsync(ChunkJob chunkJob, CancellationToken cancellationToken)
         {
-            var downloadedData = new byte[chunkJob.InternalChunk.UncompressedLength];
+            var file   = chunkJob.ManifestFile.FileName;
+            var offset = chunkJob.InternalChunk.Offset;
+            var uncLen = chunkJob.InternalChunk.UncompressedLength;
+
+            DiagnosticLog?.Invoke($"[Chunk] START  {file} off={offset} uncLen={uncLen}");
+
+            var downloadedData = new byte[uncLen];
             var downloadSuccess = false;
             var writtenBytes = 0;
             Server server = default;
@@ -434,8 +446,10 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
                 try
                 {
+                    DiagnosticLog?.Invoke($"[Chunk] GetServer  {file}@{offset}");
                     server = _serverPool.GetServer(cancellationToken);
 
+                    DiagnosticLog?.Invoke($"[Chunk] DepotChunkAsync  {file}@{offset}");
                     writtenBytes = await _serverPool.CdnClient.DownloadDepotChunkAsync(
                             DepotId,
                             chunkJob.InternalChunk,
@@ -445,11 +459,13 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                             _serverPool.DesignatedProxyServer)
                         .ConfigureAwait(false);
 
+                    DiagnosticLog?.Invoke($"[Chunk] DepotChunkAsync OK  {file}@{offset} written={writtenBytes}");
                     downloadSuccess = true;
                 }
                 catch (Exception ex)
                 {
-                    Logger?.LogError(ex, $"Failed to download chunk {chunkJob.InternalChunk.ChunkID} for file {chunkJob.ManifestFile.FileName}: {ex.Message}");
+                    DiagnosticLog?.Invoke($"[Chunk] DepotChunkAsync FAIL  {file}@{offset} {ex.GetType().Name}: {ex.Message}");
+                    Logger?.LogError(ex, $"Failed to download chunk {chunkJob.InternalChunk.ChunkID} for file {file}: {ex.Message}");
                     _serverPool.ReturnServer(server, true);
                     server = null;
                 }
@@ -457,6 +473,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
             if (server != null) _serverPool.ReturnServer(server, false);
 
+            DiagnosticLog?.Invoke($"[Chunk] WriteAsync  {file}@{offset} len={writtenBytes}");
             Logger?.LogTrace("Writing to FileWriter");
             while (true)
             {
@@ -466,15 +483,16 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                 {
                     await chunkJob.FileWriter.WriteAsync(chunkJob.InternalChunk.Offset, downloadedData[0..writtenBytes])
                         .ConfigureAwait(false);
-                    
+
                     break;
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // ignore
+                    DiagnosticLog?.Invoke($"[Chunk] WriteAsync FAIL  {file}@{offset} {ex.GetType().Name}: {ex.Message}");
                 }
             }
 
+            DiagnosticLog?.Invoke($"[Chunk] DONE  {file}@{offset}");
             Logger?.LogTrace("Completed downloading chunk");
         }
 
