@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
@@ -273,7 +274,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                 // _serverPool.Close(), and their I/O completion callbacks (TppWorkerThread)
                 // try to read from freed memory → ACCESS_VIOLATION c0000005.
                 downloadCts.Cancel();
-                await Task.Delay(50).ConfigureAwait(false);
+                await Task.Delay(200).ConfigureAwait(false);
 
                 if (_fileWriters.Count > 0)
                 {
@@ -281,9 +282,10 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
                     var disposeTasks = _fileWriters.Select(x => Task.Run(async () => await x.DisposeAsync().AsTask()));
 
-                    var cancellationTokenSource = new CancellationTokenSource();
+                    // 30-second safety timeout so disposal never hangs forever
+                    using var disposalCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
                     var cancellationTcs = new TaskCompletionSource<object>();
-                    cancellationTokenSource.Token.Register(() => cancellationTcs.TrySetCanceled(), false);
+                    disposalCts.Token.Register(() => cancellationTcs.TrySetCanceled(), false);
 
                     await Task.WhenAny(Task.WhenAll(disposeTasks), cancellationTcs.Task);
                 }
@@ -315,22 +317,37 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             var taskFactoriesSource = taskFactories.ToArray();
             var tasksRunning = new List<Task>(50);
             var index = 0;
+            ExceptionDispatchInfo firstFailure = null;
 
             do
             {
-                while (tasksRunning.Count < maxParallel && index < taskFactoriesSource.Length)
+                // Once a task has failed, stop launching new ones but keep draining the
+                // already-running ones.  Abandoning them causes orphaned IOCP callbacks
+                // that race with _serverPool.Close() → ACCESS_VIOLATION c0000005.
+                while (firstFailure == null && tasksRunning.Count < maxParallel && index < taskFactoriesSource.Length)
                 {
                     var taskFactory = taskFactoriesSource[index++];
-
                     tasksRunning.Add(taskFactory());
                 }
 
+                if (tasksRunning.Count == 0) break;
+
                 var completedTask = await Task.WhenAny(tasksRunning).ConfigureAwait(false);
-
-                await completedTask.ConfigureAwait(false);
-
                 tasksRunning.Remove(completedTask);
-            } while (index < taskFactoriesSource.Length || tasksRunning.Count != 0);
+
+                try
+                {
+                    await completedTask.ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    // Capture but don't re-throw yet — wait for remaining tasks to drain
+                    // so that no in-flight HTTP I/O callbacks outlive the server pool.
+                    firstFailure ??= ExceptionDispatchInfo.Capture(ex);
+                }
+            } while (tasksRunning.Count > 0 || (firstFailure == null && index < taskFactoriesSource.Length));
+
+            firstFailure?.Throw();
         }
 
         private Task VerifyFileAsync(ManifestFile file, string directory, ConcurrentBag<ChunkJob> chunks)
